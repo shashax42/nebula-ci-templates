@@ -1,0 +1,246 @@
+# Nebula 공용 서비스 파이프라인 (reusable workflow)
+#
+# Commit → Secrets Scan → Test → Build → Vuln Scan → Push → SBOM → Sign → GitOps
+#
+# 호출 예시는 README.md 참고. 서비스 레포는 inputs 몇 줄만 정의하면 된다.
+
+name: service-pipeline
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: 서비스 디렉터리 이름이자 이미지 이름 (예 service-order)
+        required: true
+        type: string
+      java-version:
+        description: JDK 버전
+        type: string
+        default: '21'
+      run-tests:
+        description: false면 테스트 없이 컴파일만 검증
+        type: boolean
+        default: true
+      fail-on-severity:
+        description: 이 등급 이상의 취약점이 있으면 실패 (Trivy severity 목록)
+        type: string
+        default: CRITICAL
+      gitops-repo:
+        description: 이미지 태그를 갱신할 GitOps 레포
+        type: string
+        default: shashax42/nebula-gitops
+      deploy-branch:
+        description: 이 브랜치에 push될 때만 이미지 푸시·서명·배포
+        type: string
+        default: main
+    secrets:
+      GITOPS_TOKEN:
+        description: gitops-repo에 push 가능한 토큰 (fine-grained PAT, Contents read/write)
+        required: false
+    outputs:
+      image:
+        description: 서명된 이미지 (digest 고정)
+        value: ${{ jobs.build.outputs.image }}
+
+jobs:
+  # ── Security Gate 1: 시크릿 유출 검사 ─────────────────────────
+  secrets-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.18.4
+        run: |
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+
+      - name: Scan for secrets
+        run: ./gitleaks detect --source . --redact --verbose --exit-code 1
+
+  # ── Test ─────────────────────────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.service }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Test
+        if: ${{ inputs.run-tests }}
+        run: chmod +x gradlew && ./gradlew test --no-daemon
+
+      - name: Compile only
+        if: ${{ !inputs.run-tests }}
+        run: chmod +x gradlew && ./gradlew build -x test --no-daemon
+
+      - name: Upload test report
+        if: ${{ failure() && inputs.run-tests }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.service }}-test-report
+          path: ${{ inputs.service }}/build/reports/tests
+
+  # ── Build → Vuln Scan → Push → SBOM → Sign ───────────────────
+  build:
+    needs: [secrets-scan, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # GHCR push
+      id-token: write   # cosign keyless (GitHub OIDC)
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image metadata
+        id: meta
+        run: |
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "name=ghcr.io/${owner}/${{ inputs.service }}" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref_name }}" == "${{ inputs.deploy-branch }}" ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (local)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.service }}
+          load: true
+          tags: ${{ steps.meta.outputs.name }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=${{ inputs.service }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.service }}
+
+      # Security Gate 2: 이미지 취약점
+      - name: Vulnerability scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.meta.outputs.name }}:${{ steps.meta.outputs.tag }}
+          severity: ${{ inputs.fail-on-severity }}
+          ignore-unfixed: true
+          exit-code: '1'
+          format: table
+
+      - name: Login to GHCR
+        if: steps.meta.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        id: push
+        if: steps.meta.outputs.publish == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.service }}
+          push: true
+          tags: ${{ steps.meta.outputs.name }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=${{ inputs.service }}
+
+      - name: Image reference
+        id: ref
+        if: steps.meta.outputs.publish == 'true'
+        run: echo "image=${{ steps.meta.outputs.name }}@${{ steps.push.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+      # Security Gate 3: SBOM 생성 + 이미지에 attestation으로 첨부
+      - name: Generate SBOM
+        if: steps.meta.outputs.publish == 'true'
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.ref.outputs.image }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - uses: sigstore/cosign-installer@v3
+        if: steps.meta.outputs.publish == 'true'
+
+      # Security Gate 4: keyless 서명 (클러스터에서 Kyverno가 검증)
+      - name: Sign image and attest SBOM
+        if: steps.meta.outputs.publish == 'true'
+        run: |
+          cosign sign --yes "${{ steps.ref.outputs.image }}"
+          cosign attest --yes --type spdxjson --predicate sbom.spdx.json "${{ steps.ref.outputs.image }}"
+
+  # ── GitOps: 매니페스트의 이미지 태그 갱신 → ArgoCD가 동기화 ────
+  gitops:
+    needs: build
+    if: needs.build.outputs.image != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check token
+        env:
+          TOKEN: ${{ secrets.GITOPS_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::GITOPS_TOKEN secret이 없습니다. 서비스 레포 Settings → Secrets에 추가하세요."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.gitops-repo }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+
+      - name: Bump image
+        id: bump
+        env:
+          SERVICE: ${{ inputs.service }}
+          IMAGE: ${{ needs.build.outputs.image }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          name="${IMAGE%@*}"
+          digest="${IMAGE#*@}"
+          if [ ! -d "$SERVICE" ]; then
+            echo "::notice::$SERVICE 매니페스트가 없어 배포를 건너뜁니다."
+            exit 0
+          fi
+          grep -rl "image: ${name}[:@]" "$SERVICE" \
+            | xargs -r sed -i -E "s#image: ${name}[:@][^[:space:]]+#image: ${name}:${TAG}@${digest}#g"
+          git diff --stat
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          SERVICE: ${{ inputs.service }}
+          TAG: ${{ needs.build.outputs.tag }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+        run: |
+          git config user.name "nebula-ci[bot]"
+          git config user.email "nebula-ci[bot]@users.noreply.github.com"
+          git commit -am "deploy(${SERVICE}): ${TAG}" -m "source: ${SOURCE}"
+          for i in 1 2 3; do
+            git pull --rebase && git push && exit 0
+            sleep $((i * 5))
+          done
+          exit 1
