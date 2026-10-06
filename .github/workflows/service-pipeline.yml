@@ -34,8 +34,11 @@ on:
         type: string
         default: main
     secrets:
+      GITOPS_DEPLOY_KEY:
+        description: gitops-repo의 write 권한 deploy key (SSH private key). 브랜치 보호 우회가 허용된 유일한 경로
+        required: false
       GITOPS_TOKEN:
-        description: gitops-repo에 push 가능한 토큰 (fine-grained PAT, Contents read/write)
+        description: (deprecated) deploy key가 없을 때만 쓰는 PAT. 브랜치 보호가 켜지면 push가 거부된다
         required: false
     outputs:
       image:
@@ -43,8 +46,39 @@ on:
         value: ${{ jobs.build.outputs.image }}
 
 jobs:
+  # ── 변경 감지: PR에서 이 서비스가 안 바뀌었으면 이후 job을 skip ──
+  # (required check는 skip을 통과로 본다. 실행 자체를 안 하면 Pending으로 남아 머지가 막힌다)
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      run: ${{ steps.diff.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+
+      - name: Detect changes
+        id: diff
+        env:
+          SERVICE: ${{ inputs.service }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only "$BASE" HEAD | grep -qE "^(${SERVICE}/|\.github/workflows/)"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::${SERVICE} 변경 없음, 파이프라인을 건너뜁니다."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # ── Security Gate 1: 시크릿 유출 검사 ─────────────────────────
   secrets-scan:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -65,6 +99,8 @@ jobs:
 
   # ── Test ─────────────────────────────────────────────────────
   test:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -98,7 +134,8 @@ jobs:
 
   # ── Build → Vuln Scan → Push → SBOM → Sign ───────────────────
   build:
-    needs: [secrets-scan, test]
+    needs: [changes, secrets-scan, test]
+    if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -193,19 +230,25 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Check token
+      - name: Check credentials
         env:
+          DEPLOY_KEY: ${{ secrets.GITOPS_DEPLOY_KEY }}
           TOKEN: ${{ secrets.GITOPS_TOKEN }}
         run: |
-          if [ -z "$TOKEN" ]; then
-            echo "::error::GITOPS_TOKEN secret이 없습니다. 서비스 레포 Settings → Secrets에 추가하세요."
+          if [ -n "$DEPLOY_KEY" ]; then
+            echo "gitops push: deploy key"
+          elif [ -n "$TOKEN" ]; then
+            echo "::warning::GITOPS_TOKEN(PAT)으로 push합니다. 브랜치 보호를 켜면 거부되니 GITOPS_DEPLOY_KEY로 바꾸세요."
+          else
+            echo "::error::GITOPS_DEPLOY_KEY secret이 없습니다. 서비스 레포 Settings → Secrets에 추가하세요."
             exit 1
           fi
 
       - uses: actions/checkout@v4
         with:
           repository: ${{ inputs.gitops-repo }}
-          token: ${{ secrets.GITOPS_TOKEN }}
+          ssh-key: ${{ secrets.GITOPS_DEPLOY_KEY }}
+          token: ${{ secrets.GITOPS_TOKEN || github.token }}
 
       - name: Bump image
         id: bump
